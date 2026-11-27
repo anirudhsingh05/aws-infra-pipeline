@@ -1,0 +1,580 @@
+---
+# RESOLVE action: decides WHICH units this environment must deploy, writes the manifest.
+#
+# Runs first in each environment stage. It never assumes the target-account role
+# and never plans or applies. The environment baseline is NOT stored anywhere: it is
+# the source commit of the most recent pipeline execution whose Commit-baseline action
+# for this stage SUCCEEDED, read from CodePipeline's own execution history.
+# Resolve compares baseline..source with Git, maps changes to Terragrunt units, and
+# writes manifest.json + manifest.sha256. Plan and Apply only consume that manifest.
+#
+# Input artifacts : SourceOutput (primary, FULL git clone, so .git exists)
+# Output artifact : ManifestOutput (manifest.json, manifest.sha256, env.txt)
+#
+# Required action environment variables
+#   ENV_PATH              environments/dev
+#   PIPELINE_NAME         name of this pipeline (set by your IaC, there is no built-in variable)
+#   PIPELINE_STAGE_NAME   stage this action belongs to, for example Dev
+#   TERRAFORM_VERSION     pinned version (as in buildspec-plan)
+#   TERRAGRUNT_VERSION    pinned version (as in buildspec-plan)
+#   SOURCE_COMMIT         #{SourceVariables.CommitId}
+#   PIPELINE_EXECUTION_ID #{codepipeline.PipelineExecutionId}
+# Optional
+#   ENV_NAME                 default: basename of ENV_PATH
+#   COMMIT_ACTION_NAME       default CommitBaseline (the action whose success defines the baseline)
+#   APPLY_ACTION_NAME        default Apply          (used to detect an abandoned apply)
+#   DESTROY_ACTION_NAME      default ApplyDestroy
+#   SOURCE_ARTIFACT_NAME     default SourceOutput
+#   TOOLS_MIRROR_S3          S3 prefix with the Terragrunt binary
+#   BOOTSTRAP=true           no successful Commit-baseline exists yet: select ALL units
+#   BASELINE_OVERRIDE=<sha>  repair: use this commit as the baseline instead of the history (recorded in the manifest)
+#   FULL_MODE=true           select ALL units even though a baseline exists (escape hatch, logged)
+#   NATIVE_CROSSCHECK        enforce (default) | off
+#   IMPLICIT_DEPS_FILE       JSON file in the repo, default ci/implicit-dependencies.json (optional)
+#   ACK_RENAMED_UNITS        comma separated removed unit paths whose STATE was already migrated
+#   ACK_PARTIAL_APPLY=true   continue although an earlier Apply action was abandoned (possible partial apply)
+#
+# IAM needed by this action's role: codepipeline:ListActionExecutions and
+# codepipeline:GetPipelineExecution on this pipeline. Nothing else in AWS.
+
+version: 0.2
+
+env:
+  shell: bash
+  exported-variables:
+    - RESOLVE_MODE
+    - UNIT_COUNT
+    - ADDED_COUNT
+    - DESTROY_COUNT
+    - BASELINE_COMMIT
+    - MANIFEST_SHA256
+
+phases:
+  install:
+    commands:
+      # Same pinned, verified installation as the existing buildspecs.
+      - |
+        set -euo pipefail
+        echo "Installing Terraform ${TERRAFORM_VERSION} and Terragrunt ${TERRAGRUNT_VERSION}"
+        command -v unzip >/dev/null 2>&1 || yum install -y unzip
+        command -v jq >/dev/null 2>&1 || yum install -y jq
+        CURL_OPTS=(--fail --location --proto '=https' --tlsv1.2 --silent --show-error
+                   --retry 4 --retry-delay 5 --retry-connrefused
+                   --connect-timeout 15 --max-time 900)
+        if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+          CURL_OPTS+=(--retry-all-errors)
+        fi
+        fetch() { curl "${CURL_OPTS[@]}" -o "$2" "$1"; }
+
+        fetch "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" /tmp/terraform.zip
+        unzip -o /tmp/terraform.zip terraform -d /usr/local/bin
+        chmod +x /usr/local/bin/terraform
+
+        DL=/tmp/tg-download
+        rm -rf "$DL" && mkdir -p "$DL"
+        GH_REPO="https://api.github.com/repos/gruntwork-io/terragrunt"
+
+        fetch_asset() {
+          curl "${CURL_OPTS[@]}" -H 'Accept: application/octet-stream' -o "$2" "${GH_REPO}/releases/assets/$1"
+        }
+        asset_id() {
+          local id=""
+          if command -v jq >/dev/null 2>&1; then
+            id=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .id' "$1" 2>/dev/null) || id=""
+          fi
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            id=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((a["id"] for a in d["assets"] if a["name"] == sys.argv[2]), ""))' "$1" "$2" 2>/dev/null) || id=""
+          fi
+          printf '%s' "$id"
+        }
+        from_mirror() {
+          [ -n "${TOOLS_MIRROR_S3:-}" ] || return 1
+          base="${TOOLS_MIRROR_S3%/}/terragrunt/v${TERRAGRUNT_VERSION}"
+          echo "Terragrunt: trying S3 mirror ${base}"
+          aws s3 cp "${base}/terragrunt_linux_amd64" "$DL/terragrunt_linux_amd64" || return 1
+          aws s3 cp "${base}/SHA256SUMS" "$DL/SHA256SUMS" 2>/dev/null || true
+        }
+        from_api() {
+          echo "Terragrunt: trying GitHub REST asset endpoint"
+          fetch "${GH_REPO}/releases/tags/v${TERRAGRUNT_VERSION}" "$DL/release.json" || return 1
+          bin_id=$(asset_id "$DL/release.json" terragrunt_linux_amd64)
+          sums_id=$(asset_id "$DL/release.json" SHA256SUMS)
+          [ -n "$bin_id" ] || return 1
+          fetch_asset "$bin_id" "$DL/terragrunt_linux_amd64" || return 1
+          if [ -n "$sums_id" ]; then fetch_asset "$sums_id" "$DL/SHA256SUMS" || true; fi
+        }
+        from_release_url() {
+          echo "Terragrunt: trying github.com release download URL"
+          fetch "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64" \
+            "$DL/terragrunt_linux_amd64" || return 1
+        }
+        if ! from_mirror && ! from_api && ! from_release_url; then
+          echo "ERROR: every Terragrunt source failed for v${TERRAGRUNT_VERSION}."
+          exit 1
+        fi
+        (
+          cd "$DL"
+          test "$(head -c 4 terragrunt_linux_amd64 | od -An -tx1 | tr -d ' \n')" = "7f454c46"
+          if [ -s SHA256SUMS ]; then
+            grep -E '[[:space:]]terragrunt_linux_amd64$' SHA256SUMS | sha256sum -c -
+          else
+            echo "WARNING: no SHA256SUMS available; installing without checksum verification"
+          fi
+        )
+        install -m 0755 "$DL/terragrunt_linux_amd64" /usr/local/bin/terragrunt
+        terraform -version
+        terragrunt --version
+
+  pre_build:
+    commands:
+      - |
+        set -euo pipefail
+        export TF_IN_AUTOMATION=true TG_NON_INTERACTIVE=true
+
+        : "${ENV_PATH:?ENV_PATH is required}"
+        : "${PIPELINE_NAME:?PIPELINE_NAME is required}"
+        : "${PIPELINE_STAGE_NAME:?PIPELINE_STAGE_NAME is required}"
+        : "${PIPELINE_EXECUTION_ID:?PIPELINE_EXECUTION_ID is required}"
+        export ENV_PATH="${ENV_PATH%/}"
+        export ENV_NAME="${ENV_NAME:-$(basename "$ENV_PATH")}"
+        export COMMIT_ACTION_NAME="${COMMIT_ACTION_NAME:-CommitBaseline}"
+        export APPLY_ACTION_NAME="${APPLY_ACTION_NAME:-Apply}"
+        export DESTROY_ACTION_NAME="${DESTROY_ACTION_NAME:-ApplyDestroy}"
+        export SOURCE_ARTIFACT_NAME="${SOURCE_ARTIFACT_NAME:-SourceOutput}"
+        export SOURCE_COMMIT="${SOURCE_COMMIT:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-}}"
+        [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: SOURCE_COMMIT is not a 40-hex commit: '${SOURCE_COMMIT}'"; exit 1; }
+        test -d "${CODEBUILD_SRC_DIR}/${ENV_PATH}"
+
+        # URL-free working copy, same reason as the Plan/Apply buildspecs. .git is copied
+        # because Git comparison needs it.
+        export SRC_ROOT=/tmp/src BASE_ROOT=/tmp/base WORK_DIR=/tmp/resolve-work
+        rm -rf "$SRC_ROOT" "$BASE_ROOT" "$WORK_DIR" && mkdir -p "$SRC_ROOT" "$WORK_DIR"
+        cp -a "${CODEBUILD_SRC_DIR}/." "$SRC_ROOT/"
+        test "$(git -C "$SRC_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" \
+          || { echo "ERROR: checkout HEAD does not equal SOURCE_COMMIT"; exit 1; }
+        test "$(git -C "$SRC_ROOT" rev-parse --is-shallow-repository)" = "false" \
+          || { echo "ERROR: shallow clone. Configure the source action with output format 'Full clone'."; exit 1; }
+        # A stray filters file would silently narrow Terragrunt discovery.
+        ! find "$SRC_ROOT" -name '.terragrunt-filters' -not -path '*/.git/*' | grep -q . \
+          || { echo "ERROR: .terragrunt-filters exists in the repository"; exit 1; }
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        export TG_NON_INTERACTIVE=true
+        OUT_DIR="${CODEBUILD_SRC_DIR}/resolve-output"
+        mkdir -p "$OUT_DIR"
+        export OUT_DIR
+
+        # ---- 1. Baseline = source commit of the last execution whose commit action SUCCEEDED ---
+        # Nothing is stored. CodePipeline's execution history (kept up to 12 months) is the record.
+        # Action execution times are ISO strings or epoch numbers depending on CLI settings,
+        # so the selection is done in Python, not jq.
+        aws codepipeline list-action-executions --pipeline-name "$PIPELINE_NAME" --output json > "$WORK_DIR/actions.json" \
+          || { echo "ERROR: could not read the execution history of ${PIPELINE_NAME} (permissions, name, or API failure). Refusing to guess."; exit 1; }
+
+        python3 - <<'PY' > "$WORK_DIR/history.env"
+        import json, os, sys, datetime
+
+        def ts(v):
+            if isinstance(v, (int, float)):
+                return float(v)
+            return datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+
+        d = json.load(open(os.path.join(os.environ['WORK_DIR'], 'actions.json'))).get('actionExecutionDetails') or []
+        stage = os.environ['PIPELINE_STAGE_NAME']
+        me = os.environ['PIPELINE_EXECUTION_ID']
+        rows = [x for x in d if x.get('stageName') == stage and x.get('pipelineExecutionId') != me]
+
+        ok = [x for x in rows if x['actionName'] == os.environ['COMMIT_ACTION_NAME'] and x['status'] == 'Succeeded']
+        last = max(ok, key=lambda x: ts(x['startTime'])) if ok else None
+        print('LAST_OK_EXECUTION=%s' % (last['pipelineExecutionId'] if last else ''))
+
+        # An Apply that another execution abandoned after the last good commit may have left a
+        # partial apply. Failed is fine (it is the known recovery case); Abandoned/InProgress is not.
+        since = ts(last['startTime']) if last else 0
+        sus = [x for x in rows if x['actionName'] in (os.environ['APPLY_ACTION_NAME'], os.environ['DESTROY_ACTION_NAME'])
+               and x['status'] in ('Abandoned', 'InProgress') and ts(x['startTime']) > since]
+        print('SUSPECT_APPLY=%s' % ','.join(sorted({x['pipelineExecutionId'] for x in sus})))
+        PY
+        . "$WORK_DIR/history.env"
+
+        BASE_COMMIT=""; BASE_SOURCE=""
+        if [ -n "${BASELINE_OVERRIDE:-}" ]; then
+          BASE_COMMIT="$BASELINE_OVERRIDE"; BASE_SOURCE="override"
+          echo "WARNING: BASELINE_OVERRIDE is set. Using ${BASE_COMMIT} instead of the pipeline history."
+        elif [ -n "$LAST_OK_EXECUTION" ]; then
+          if [ "${BOOTSTRAP:-false}" = "true" ]; then
+            echo "ERROR: BOOTSTRAP=true but execution ${LAST_OK_EXECUTION} already completed ${COMMIT_ACTION_NAME} for stage ${PIPELINE_STAGE_NAME}"; exit 1
+          fi
+          aws codepipeline get-pipeline-execution --pipeline-name "$PIPELINE_NAME" --pipeline-execution-id "$LAST_OK_EXECUTION" \
+            --query 'pipelineExecution.artifactRevisions' --output json > "$WORK_DIR/revisions.json"
+          BASE_COMMIT=$(jq -r --arg n "$SOURCE_ARTIFACT_NAME" '(map(select(.name == $n)) | first // .[0]).revisionId // empty' "$WORK_DIR/revisions.json")
+          BASE_SOURCE="pipeline-history:${LAST_OK_EXECUTION}"
+        else
+          if [ "${BOOTSTRAP:-false}" != "true" ]; then
+            echo "ERROR: no successful ${COMMIT_ACTION_NAME} found for stage ${PIPELINE_STAGE_NAME} in the last 12 months of ${PIPELINE_NAME}."
+            echo "       Refusing to guess. Run once with BOOTSTRAP=true (all units), or BASELINE_OVERRIDE=<commit> if you know what is deployed."; exit 1
+          fi
+          BASE_SOURCE="bootstrap"
+        fi
+        if [ -n "$BASE_COMMIT" ]; then
+          [[ "$BASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: baseline is not a 40-hex commit: '${BASE_COMMIT}'"; exit 1; }
+        fi
+        export BASE_SOURCE
+
+        # ---- 2. Possible partial apply left by another execution ----------------------------
+        if [ -n "${SUSPECT_APPLY:-}" ] && [ "${ACK_PARTIAL_APPLY:-false}" != "true" ]; then
+          echo "ERROR: execution(s) ${SUSPECT_APPLY} abandoned an Apply for stage ${PIPELINE_STAGE_NAME} after the last good baseline."
+          echo "       Infrastructure may be partly changed. Inspect it, then set ACK_PARTIAL_APPLY=true. (A plain 'Failed' Apply does not block.)"; exit 1
+        fi
+
+        # ---- 3. Mode --------------------------------------------------------------------------
+        if [ -z "$BASE_COMMIT" ]; then RESOLVE_MODE=bootstrap
+        elif [ "${FULL_MODE:-false}" = "true" ]; then RESOLVE_MODE=full
+        elif [ "$BASE_COMMIT" = "$SOURCE_COMMIT" ]; then RESOLVE_MODE=noop
+        else RESOLVE_MODE=incremental
+        fi
+        export RESOLVE_MODE BASE_COMMIT
+        echo "Mode: ${RESOLVE_MODE}   baseline: ${BASE_COMMIT:-none}   source: ${SOURCE_COMMIT}"
+
+        # ---- 4. Commit validation and changed files ------------------------------------------
+        if [ -n "$BASE_COMMIT" ]; then
+          git -C "$SRC_ROOT" cat-file -e "${BASE_COMMIT}^{commit}" \
+            || { echo "ERROR: baseline commit ${BASE_COMMIT} is not in this clone (history rewritten or fetch failed)"; exit 1; }
+          git -C "$SRC_ROOT" merge-base --is-ancestor "$BASE_COMMIT" "$SOURCE_COMMIT" \
+            || { echo "ERROR: baseline ${BASE_COMMIT} is not an ancestor of ${SOURCE_COMMIT} (rollback or rewritten history)"; exit 1; }
+          # Written to a file first, so a Git failure stops the build instead of looking like 'no changes'.
+          git -C "$SRC_ROOT" diff --name-status -z -M "$BASE_COMMIT" "$SOURCE_COMMIT" > "$WORK_DIR/changes.nul"
+        else
+          : > "$WORK_DIR/changes.nul"
+        fi
+
+        # ---- 5. Inventories (Terragrunt is the source of truth for units, graph, reads) ------
+        inventory() {
+          ( cd "$1/${ENV_PATH}" && terragrunt find --json --dependencies --reading --no-filters-file ) > "$2"
+          jq -e 'type == "array" and length > 0' "$2" >/dev/null || { echo "ERROR: empty or invalid inventory $2"; exit 1; }
+        }
+        if [ "$RESOLVE_MODE" != "noop" ]; then
+          inventory "$SRC_ROOT" "$WORK_DIR/head.json"
+          if [ -n "$BASE_COMMIT" ]; then
+            git -C "$SRC_ROOT" worktree add --detach "$BASE_ROOT" "$BASE_COMMIT" >/dev/null
+            inventory "$BASE_ROOT" "$WORK_DIR/base.json"
+          fi
+        fi
+
+        # ---- 6. Impact analysis ---------------------------------------------------------------
+        python3 - <<'PY'
+        import json, os, sys, posixpath, fnmatch, subprocess, datetime, collections
+
+        E = os.environ['ENV_PATH'].strip('/')
+        SRC = os.environ['SRC_ROOT']
+        BASE_ROOT = os.environ['BASE_ROOT']
+        SOURCE = os.environ['SOURCE_COMMIT']
+        BASE = os.environ.get('BASE_COMMIT', '')
+        MODE = os.environ['RESOLVE_MODE']
+        WORK = os.environ['WORK_DIR']
+        OUT = os.environ['OUT_DIR']
+
+        def die(msg):
+            sys.stderr.write('ERROR: %s\n' % msg)
+            sys.exit(1)
+
+        def _fwd(p):
+            return p.replace('\\', '/').rstrip('/')
+
+        def norm(p, root):
+            p = p.replace('\\', '/')
+            for r in {_fwd(root), _fwd(os.path.realpath(root))}:
+                if p.startswith(r + '/'):
+                    return posixpath.normpath(p[len(r) + 1:])
+            if p.startswith('/') or (len(p) > 2 and p[1] == ':'):
+                return p                      # absolute and outside the checkout: cannot match a repo file
+            return posixpath.normpath(posixpath.join(E, p))
+
+        def load(path, root):
+            with open(path) as fh:
+                data = json.load(fh)
+            units = {}
+            for it in data:
+                if it.get('type') != 'unit':
+                    continue
+                units[norm(it['path'], root)] = {
+                    'deps': {norm(d, root) for d in (it.get('dependencies') or [])},
+                    'reading': {norm(r, root) for r in (it.get('reading') or [])},
+                }
+            return units
+
+        def topo(nodes, deps_of):
+            nodes = set(nodes)
+            indeg = {n: len([d for d in deps_of(n) if d in nodes]) for n in nodes}
+            ready = sorted(n for n in nodes if indeg[n] == 0)
+            order = []
+            while ready:
+                n = ready.pop(0)
+                order.append(n)
+                for m in sorted(nodes):
+                    if n in deps_of(m) and m not in order and m not in ready:
+                        indeg[m] -= 1
+                        if indeg[m] == 0:
+                            ready.append(m)
+                ready.sort()
+            if len(order) != len(nodes):
+                die('dependency cycle among: %s' % sorted(nodes - set(order)))
+            return order
+
+        head, base = {}, {}
+        if MODE != 'noop':
+            head = load(os.path.join(WORK, 'head.json'), SRC)
+            if BASE:
+                base = load(os.path.join(WORK, 'base.json'), BASE_ROOT)
+
+            # Guards: inventory must be complete.
+            on_disk = set()
+            for d, dirs, files in os.walk(os.path.join(SRC, E)):
+                dirs[:] = [x for x in dirs if not x.startswith('.')]
+                if 'terragrunt.hcl' in files:
+                    on_disk.add(posixpath.relpath(d.replace('\\', '/'), SRC.replace('\\', '/')))
+            if on_disk != set(head):
+                die('unit discovery does not match terragrunt.hcl files on disk. only on disk: %s; only in inventory: %s'
+                    % (sorted(on_disk - set(head)), sorted(set(head) - on_disk)))
+            for u, d in head.items():
+                for must in (E + '/env.hcl', E + '/root.hcl'):
+                    if must not in d['reading']:
+                        die('unit %s does not read %s: the inventory looks incomplete' % (u, must))
+
+        dependents = collections.defaultdict(set)
+        for u, d in head.items():
+            for dep in d['deps']:
+                dependents[dep].add(u)
+
+        modules_of = {u: {posixpath.dirname(r) for r in d['reading'] if r.startswith('modules/')} for u, d in head.items()}
+
+        implicit = []
+        ipath = os.path.join(SRC, os.environ.get('IMPLICIT_DEPS_FILE', 'ci/implicit-dependencies.json'))
+        if os.path.exists(ipath):
+            with open(ipath) as fh:
+                implicit = json.load(fh)
+
+        # ---- changed files ------------------------------------------------------------------
+        toks = open(os.path.join(WORK, 'changes.nul'), 'rb').read().split(b'\0')
+        if toks and toks[-1] == b'':
+            toks.pop()
+        changes, renames = [], []
+        i = 0
+        while i < len(toks):
+            st = toks[i].decode()
+            i += 1
+            if st[0] in 'RC':
+                old, new = toks[i].decode(), toks[i + 1].decode()
+                i += 2
+                changes.append(('D' if st[0] == 'R' else 'A', old))
+                changes.append(('A', new))
+                if st[0] == 'R':
+                    renames.append((old, new))
+            else:
+                changes.append((st[0], toks[i].decode()))
+                i += 1
+
+        DOC_EXT = {'.md', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.pdf'}
+        def is_doc(f):
+            return (posixpath.splitext(f)[1].lower() in DOC_EXT or posixpath.basename(f) == '.gitkeep'
+                    or f.startswith(('scripts/', 'docs/', '.agents/', '.kiro/')))
+
+        def enclosing(f, units):
+            c = [u for u in units if f.startswith(u + '/')]
+            return max(c, key=len) if c else None
+
+        seeds = collections.defaultdict(list)
+        ignored, unmapped, not_consumed, other_env, covered = [], [], [], [], []
+
+        def add(u, reason):
+            if reason not in seeds[u]:
+                seeds[u].append(reason)
+
+        def process(st, f):
+            hit = False
+            direct = set()
+            for u, d in head.items():
+                if f == u + '/terragrunt.hcl' or f in d['reading']:
+                    add(u, '%s %s' % ({'A': 'added', 'D': 'deleted', 'M': 'changed'}.get(st, 'changed'), f)); hit = True
+                    direct.add(u)
+            for u, d in base.items():
+                if u in head and u not in direct and f in d['reading']:
+                    add(u, 'file it used to read was %s: %s' % ('deleted' if st == 'D' else 'changed', f)); hit = True
+            if hit:
+                return
+            eb = enclosing(f, base)
+            if eb and eb not in head:
+                covered.append(f)            # belongs to a removed unit, handled below
+                return
+            if is_doc(f):
+                ignored.append(f)
+                return
+            for u in head:
+                for md in modules_of[u]:
+                    if f.startswith(md + '/'):
+                        add(u, 'file in its module %s: %s' % (md, f)); hit = True
+            enc = enclosing(f, head)
+            if enc:
+                add(enc, 'file inside unit: %s' % f); hit = True
+            for rule in implicit:
+                if fnmatch.fnmatch(f, rule['pattern']):
+                    for u in rule['units']:
+                        if u in head:
+                            add(u, 'implicit rule %s: %s' % (rule['pattern'], f)); hit = True
+            if hit:
+                return
+            if f.startswith(E + '/'):
+                unmapped.append(f)
+            elif f.startswith('modules/'):
+                not_consumed.append(f)
+            else:
+                other_env.append(f)
+
+        added = set(head) - set(base) if BASE else set()
+        removed = set(base) - set(head) if BASE else set()
+
+        if MODE in ('bootstrap', 'full'):
+            for u in head:
+                add(u, '%s mode: all units' % MODE)
+        for st, f in changes:
+            process(st, f)
+        for u in sorted(added):
+            add(u, 'added unit')
+
+        if unmapped:
+            die('files under %s that no rule maps to a unit (fail closed): %s' % (E, sorted(unmapped)))
+
+        # ---- dependents ---------------------------------------------------------------------
+        selected = dict((u, list(r)) for u, r in seeds.items() if u in head)
+        queue = list(selected)
+        while queue:
+            n = queue.pop()
+            for m in dependents.get(n, ()):
+                if m not in selected:
+                    selected[m] = ['downstream of %s' % n]
+                    queue.append(m)
+
+        # Added units cannot be planned together with a unit that needs their outputs
+        # (mock outputs are not allowed for plan in this repository).
+        for u in selected:
+            bad = head[u]['deps'] & added
+            if bad:
+                die('%s depends on newly added unit(s) %s. A plan cannot read outputs that do not exist yet. Split into two merges.'
+                    % (u, sorted(bad)))
+
+        order = topo(selected, lambda n: head[n]['deps'])
+
+        # ---- removed units ------------------------------------------------------------------
+        ack = {x.strip() for x in os.environ.get('ACK_RENAMED_UNITS', '').split(',') if x.strip()}
+        destroy_units = []
+        for r in sorted(removed):
+            renamed_to = None
+            for old, new in renames:
+                if old.startswith(r + '/'):
+                    tgt = enclosing(new, head)
+                    if tgt in added:
+                        renamed_to = tgt
+            # Terragrunt silently drops a dependency whose directory no longer exists, so the
+            # SOURCE graph cannot show who still points at the removed unit. Check the BASE graph:
+            # a surviving dependent must have been edited in this diff AND must no longer mention
+            # the removed unit's relative path in the HCL it reads.
+            remaining = []
+            for u in sorted(head):
+                if u in base and r in base[u]['deps']:
+                    rel = posixpath.relpath(r, u)
+                    files = [u + '/terragrunt.hcl'] + [x for x in head[u]['reading'] if x.startswith(E + '/') and x.endswith('.hcl')]
+                    text = ''
+                    for x in files:
+                        try:
+                            text += open(os.path.join(SRC, x), encoding='utf-8', errors='replace').read()
+                        except OSError:
+                            pass
+                    if u not in seeds or rel in text or r in text:
+                        remaining.append(u)
+            if remaining:
+                die('removed unit %s is still referenced by %s. Remove the dependency first (or in the same change, and re-check).' % (r, remaining))
+            if renamed_to and r not in ack:
+                die('unit %s looks renamed to %s. State is keyed by path: migrate the state, then list %s in ACK_RENAMED_UNITS.' % (r, renamed_to, r))
+            destroy_units.append({
+                'path': r,
+                'disposition': 'acknowledged-rename' if renamed_to else 'destroy-candidate',
+                'renamed_to': renamed_to,
+                'from_commit': BASE,
+            })
+        cands = [d['path'] for d in destroy_units if d['disposition'] == 'destroy-candidate']
+        destroy_order = list(reversed(topo(cands, lambda n: base[n]['deps']))) if cands else []
+
+        # ---- native cross-check (lower bound) ---------------------------------------------
+        crosscheck = 'skipped'
+        if MODE == 'incremental' and os.environ.get('NATIVE_CROSSCHECK', 'enforce') != 'off':
+            cmd = ['terragrunt', 'find', '--filter', '[%s...%s] | ./%s/**' % (BASE, SOURCE, E),
+                   '--filter-allow-destroy', '--json', '--no-filters-file']
+            res = subprocess.run(cmd, cwd=SRC, capture_output=True, text=True)
+            if res.returncode != 0:
+                die('native cross-check failed (exit %d): %s' % (res.returncode, res.stderr[-800:]))
+            native = set()
+            for it in json.loads(res.stdout or '[]'):
+                p = it['path'].replace('\\', '/')
+                k = p.find(E + '/')
+                native.add(p[k:] if k >= 0 else p)
+            missing = native - set(selected) - removed
+            if missing:
+                die('native Terragrunt selected units the impact analysis did not: %s' % sorted(missing))
+            crosscheck = 'pass'
+
+        # ---- manifest -----------------------------------------------------------------------
+        manifest = {
+            'schema': 1,
+            'environment': os.environ['ENV_NAME'],
+            'env_path': E,
+            'mode': MODE,
+            'pipeline': {'execution_id': os.environ['PIPELINE_EXECUTION_ID'], 'name': os.environ.get('CODEBUILD_INITIATOR', '')},
+            'source': {'commit': SOURCE},
+            'baseline': {'commit': BASE or None, 'source': os.environ.get('BASE_SOURCE', ''),
+                         'pipeline': os.environ['PIPELINE_NAME'], 'stage': os.environ['PIPELINE_STAGE_NAME']},
+            'tools': {'terraform': os.environ.get('TERRAFORM_VERSION'), 'terragrunt': os.environ.get('TERRAGRUNT_VERSION')},
+            'detection': {'status': 'ok', 'native_crosscheck': crosscheck, 'unmapped_files': [],
+                          'implicit_rules_file': bool(implicit)},
+            'changed_files': [{'status': s, 'path': f} for s, f in changes],
+            'ignored_files': sorted(ignored),
+            'files_of_removed_units': sorted(covered),
+            'modules_not_consumed_by_env': sorted(not_consumed),
+            'other_environment_files': sorted(other_env),
+            'units': [{'path': u, 'order': n + 1, 'reasons': selected[u]} for n, u in enumerate(order)],
+            'added_units': sorted(added),
+            'destroy_units': destroy_units,
+            'destroy_order': destroy_order,
+            'dependency_order': order,
+            'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        with open(os.path.join(OUT, 'manifest.json'), 'w') as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
+            fh.write('\n')
+        with open(os.path.join(WORK, 'resolve.env'), 'w') as fh:
+            fh.write('UNIT_COUNT=%d\nADDED_COUNT=%d\nDESTROY_COUNT=%d\n' % (len(order), len(added), len(destroy_units)))
+        print('Units selected: %d, added: %d, removed: %d, ignored files: %d' % (len(order), len(added), len(removed), len(ignored)))
+        for u in order:
+            print('  %s  <- %s' % (u, '; '.join(selected[u][:2])))
+        for d in destroy_units:
+            print('  REMOVED %s (%s)' % (d['path'], d['disposition']))
+        PY
+
+        . "$WORK_DIR/resolve.env"
+        ( cd "$OUT_DIR" && sha256sum manifest.json > manifest.sha256 )
+        printf '%s\n' "$ENV_PATH" > "$OUT_DIR/env.txt"
+        export MANIFEST_SHA256 BASELINE_COMMIT
+        MANIFEST_SHA256=$(cut -d' ' -f1 "$OUT_DIR/manifest.sha256")
+        BASELINE_COMMIT="${BASE_COMMIT:-none}"
+        export RESOLVE_MODE UNIT_COUNT ADDED_COUNT DESTROY_COUNT
+        echo "manifest sha256: ${MANIFEST_SHA256}"
+
+artifacts:
+  base-directory: resolve-output
+  files:
+    - manifest.json
+    - manifest.sha256
+    - env.txt
+  discard-paths: yes

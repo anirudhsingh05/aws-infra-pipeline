@@ -1,0 +1,272 @@
+---
+# APPLY action (selective): applies the saved plans of the approved manifest, nothing else.
+#
+# This buildspec never calculates which units to run and never touches the baseline.
+# It runs in one of two modes (action environment variable APPLY_MODE):
+#   changes  (default)  applies the normal saved plans (units with plan_result=changes)
+#   destroy             applies the saved DESTROY plans for removed units. Use it only in a
+#                       separate action placed behind its own manual approval, after the
+#                       "changes" Apply has succeeded.
+#
+# Input artifact : PlanOutput (secondary), SourceOutput (primary)
+# Output         : none. Success or failure of this ACTION is the record; the
+#                  Commit-baseline action reads it from CodePipeline's history.
+#
+# Required action environment variables
+#   ENV_PATH, TARGET_ROLE_ARN, TARGET_ACCOUNT_ID, TERRAFORM_VERSION, TERRAGRUNT_VERSION
+#   PIPELINE_EXECUTION_ID  #{codepipeline.PipelineExecutionId}
+#   EXPECTED_MANIFEST_SHA256     #{PlanDev.MANIFEST_SHA256}      (variable exported by the Plan action)
+#   EXPECTED_PLAN_RESULT_SHA256  #{PlanDev.PLAN_RESULT_SHA256}
+# Required only for APPLY_MODE=destroy
+#   PIPELINE_NAME, PIPELINE_STAGE_NAME
+# Optional
+#   APPLY_MODE (changes|destroy), TOOLS_MIRROR_S3,
+#   PLAN_ACTION_NAME (default Plan), APPLY_ACTION_NAME (default Apply),
+#   TG_RUN_EXTRA_ARGS (for example --parallelism 4)
+#
+# IAM: sts:AssumeRole on TARGET_ROLE_ARN. For destroy mode also
+#      codepipeline:ListActionExecutions on this pipeline. No SSM, no DynamoDB.
+
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - |
+        set -euo pipefail
+        echo "Installing Terraform ${TERRAFORM_VERSION} and Terragrunt ${TERRAGRUNT_VERSION}"
+        command -v unzip >/dev/null 2>&1 || yum install -y unzip
+        command -v jq >/dev/null 2>&1 || yum install -y jq
+        CURL_OPTS=(--fail --location --proto '=https' --tlsv1.2 --silent --show-error
+                   --retry 4 --retry-delay 5 --retry-connrefused
+                   --connect-timeout 15 --max-time 900)
+        if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+          CURL_OPTS+=(--retry-all-errors)
+        fi
+        fetch() { curl "${CURL_OPTS[@]}" -o "$2" "$1"; }
+
+        fetch "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" /tmp/terraform.zip
+        unzip -o /tmp/terraform.zip terraform -d /usr/local/bin
+        chmod +x /usr/local/bin/terraform
+
+        DL=/tmp/tg-download
+        rm -rf "$DL" && mkdir -p "$DL"
+        GH_REPO="https://api.github.com/repos/gruntwork-io/terragrunt"
+
+        fetch_asset() {
+          curl "${CURL_OPTS[@]}" -H 'Accept: application/octet-stream' -o "$2" "${GH_REPO}/releases/assets/$1"
+        }
+        asset_id() {
+          local id=""
+          if command -v jq >/dev/null 2>&1; then
+            id=$(jq -r --arg n "$2" '.assets[] | select(.name == $n) | .id' "$1" 2>/dev/null) || id=""
+          fi
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            id=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((a["id"] for a in d["assets"] if a["name"] == sys.argv[2]), ""))' "$1" "$2" 2>/dev/null) || id=""
+          fi
+          printf '%s' "$id"
+        }
+        from_mirror() {
+          [ -n "${TOOLS_MIRROR_S3:-}" ] || return 1
+          base="${TOOLS_MIRROR_S3%/}/terragrunt/v${TERRAGRUNT_VERSION}"
+          echo "Terragrunt: trying S3 mirror ${base}"
+          aws s3 cp "${base}/terragrunt_linux_amd64" "$DL/terragrunt_linux_amd64" || return 1
+          aws s3 cp "${base}/SHA256SUMS" "$DL/SHA256SUMS" 2>/dev/null || true
+        }
+        from_api() {
+          echo "Terragrunt: trying GitHub REST asset endpoint"
+          fetch "${GH_REPO}/releases/tags/v${TERRAGRUNT_VERSION}" "$DL/release.json" || return 1
+          bin_id=$(asset_id "$DL/release.json" terragrunt_linux_amd64)
+          sums_id=$(asset_id "$DL/release.json" SHA256SUMS)
+          [ -n "$bin_id" ] || return 1
+          fetch_asset "$bin_id" "$DL/terragrunt_linux_amd64" || return 1
+          if [ -n "$sums_id" ]; then fetch_asset "$sums_id" "$DL/SHA256SUMS" || true; fi
+        }
+        from_release_url() {
+          echo "Terragrunt: trying github.com release download URL"
+          fetch "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64" \
+            "$DL/terragrunt_linux_amd64" || return 1
+        }
+        if ! from_mirror && ! from_api && ! from_release_url; then
+          echo "ERROR: every Terragrunt source failed for v${TERRAGRUNT_VERSION}."
+          exit 1
+        fi
+        (
+          cd "$DL"
+          test "$(head -c 4 terragrunt_linux_amd64 | od -An -tx1 | tr -d ' \n')" = "7f454c46"
+          if [ -s SHA256SUMS ]; then
+            grep -E '[[:space:]]terragrunt_linux_amd64$' SHA256SUMS | sha256sum -c -
+          else
+            echo "WARNING: no SHA256SUMS available; installing without checksum verification"
+          fi
+        )
+        install -m 0755 "$DL/terragrunt_linux_amd64" /usr/local/bin/terragrunt
+        terraform -version
+        terragrunt --version
+
+  pre_build:
+    commands:
+      - |
+        set -euo pipefail
+        export TF_IN_AUTOMATION=true TG_NON_INTERACTIVE=true
+        : "${ENV_PATH:?}" "${PIPELINE_EXECUTION_ID:?}" "${TARGET_ROLE_ARN:?}" "${TARGET_ACCOUNT_ID:?}"
+        export ENV_PATH="${ENV_PATH%/}"
+        export APPLY_MODE="${APPLY_MODE:-changes}"
+        case "$APPLY_MODE" in changes|destroy) ;; *) echo "ERROR: APPLY_MODE must be changes or destroy"; exit 1;; esac
+        # Output artifact names are unique per pipeline (for example PlanOutputDev); PLAN_ARTIFACT_NAME says which.
+        PV="CODEBUILD_SRC_DIR_${PLAN_ARTIFACT_NAME:-PlanOutput}"
+        test -n "${!PV:-}" || { echo "ERROR: input artifact ${PLAN_ARTIFACT_NAME:-PlanOutput} is not attached to this action"; exit 1; }
+        export SAVED="${!PV}"
+
+        # ---- 1. integrity of what was approved ---------------------------------------------
+        test "$(cat "$SAVED/env.txt")" = "$ENV_PATH"
+        ( cd "$SAVED" && sha256sum -c manifest.sha256 && sha256sum -c plan-result.sha256 && sha256sum -c plans.sha256 )
+        export MANIFEST_SHA256;    MANIFEST_SHA256=$(cut -d' ' -f1 "$SAVED/manifest.sha256")
+        export PLAN_RESULT_SHA256; PLAN_RESULT_SHA256=$(cut -d' ' -f1 "$SAVED/plan-result.sha256")
+        jq -e --arg e "$ENV_PATH" --arg x "$PIPELINE_EXECUTION_ID" --arg m "$MANIFEST_SHA256" \
+          '.schema == 1 and .env_path == $e and .pipeline.execution_id == $x' "$SAVED/manifest.json" >/dev/null \
+          || { echo "ERROR: manifest is not for this environment/execution"; exit 1; }
+        jq -e --arg m "$MANIFEST_SHA256" '.manifest_sha256 == $m' "$SAVED/plan-result.json" >/dev/null \
+          || { echo "ERROR: plan-result does not belong to this manifest"; exit 1; }
+
+        # Plan age
+        EXPIRES=$(jq -r '.expires_at' "$SAVED/plan-result.json")
+        test "$(date -u +%s)" -lt "$(date -u -d "$EXPIRES" +%s)" \
+          || { echo "ERROR: the plan expired at ${EXPIRES}. Retry the stage to re-plan."; exit 1; }
+
+        # ---- 2. the hashes CodePipeline recorded when Plan ran must match the artifacts ----
+        # They travel as pipeline variables, a different channel from the artifact bucket, so
+        # replacing files in S3 between Plan and Apply is detected.
+        : "${EXPECTED_MANIFEST_SHA256:?pass #{PlanNs.MANIFEST_SHA256}}" "${EXPECTED_PLAN_RESULT_SHA256:?pass #{PlanNs.PLAN_RESULT_SHA256}}"
+        [ "$MANIFEST_SHA256" = "$EXPECTED_MANIFEST_SHA256" ] \
+          || { echo "ERROR: manifest hash differs from the one Plan reported. Artifacts may have been altered or replaced."; exit 1; }
+        [ "$PLAN_RESULT_SHA256" = "$EXPECTED_PLAN_RESULT_SHA256" ] \
+          || { echo "ERROR: plan-result hash differs from the one Plan reported. Artifacts may have been altered or replaced."; exit 1; }
+        APPLY_REQUIRED=$(jq -r '.apply_required' "$SAVED/plan-result.json")
+        DESTROY_REQUIRED=$(jq -r '.destroy_required' "$SAVED/plan-result.json")
+
+        # ---- 3. destroy mode: the normal apply of THIS plan must already have succeeded ----
+        if [ "$APPLY_MODE" = "destroy" ]; then
+          [ "$DESTROY_REQUIRED" = "true" ] || { echo "ERROR: no destroy plan has changes; nothing to destroy"; exit 1; }
+          if [ "$APPLY_REQUIRED" = "true" ]; then
+            : "${PIPELINE_NAME:?}" "${PIPELINE_STAGE_NAME:?}"
+            export PLAN_ACTION_NAME="${PLAN_ACTION_NAME:-Plan}" APPLY_ACTION_NAME="${APPLY_ACTION_NAME:-Apply}"
+            WORK=/tmp/apply-work; rm -rf "$WORK"; mkdir -p "$WORK"; export WORK
+            aws codepipeline list-action-executions --pipeline-name "$PIPELINE_NAME" \
+              --filter "pipelineExecutionId=${PIPELINE_EXECUTION_ID}" --output json > "$WORK/actions.json"
+            python3 - <<'PY' || { echo "ERROR: destroy is allowed only after the Apply action succeeded for the latest Plan of this execution"; exit 1; }
+        import json, os, sys, datetime
+        def ts(v):
+            if isinstance(v, (int, float)):
+                return float(v)
+            return datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+        rows = [x for x in json.load(open(os.path.join(os.environ['WORK'], 'actions.json'))).get('actionExecutionDetails') or []
+                if x.get('stageName') == os.environ['PIPELINE_STAGE_NAME']]
+        plans = [ts(x['startTime']) for x in rows if x['actionName'] == os.environ['PLAN_ACTION_NAME'] and x['status'] == 'Succeeded']
+        if not plans:
+            sys.exit(1)
+        t = max(plans)
+        sys.exit(0 if any(x['actionName'] == os.environ['APPLY_ACTION_NAME'] and x['status'] == 'Succeeded' and ts(x['startTime']) > t for x in rows) else 1)
+        PY
+          fi
+        fi
+
+        # ---- 4. same working copy as Plan; fingerprint must match -------------------------
+        export SRC_ROOT=/tmp/src BASE_ROOT=/tmp/base
+        rm -rf "$SRC_ROOT" "$BASE_ROOT" && mkdir -p "$SRC_ROOT"
+        cp -a "${CODEBUILD_SRC_DIR}/." "$SRC_ROOT/"
+        echo "checkout:     ${CODEBUILD_SRC_DIR}"
+        echo "working copy: ${SRC_ROOT}"
+        test "$(git -C "$SRC_ROOT" rev-parse HEAD)" = "$(jq -r '.source_commit' "$SAVED/plan-result.json")"
+        fingerprint() {
+          ( cd "$1" && find . -type f ! -path '*/.git/*' ! -path '*/.terragrunt-cache/*' ! -path '*/.terraform/*' ! -path './plan-output/*' -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}' )
+        }
+        test "$(fingerprint "$SRC_ROOT")" = "$(cat "$SAVED/source.sha256")"
+
+        # ---- 5. restore plans, verify EVERY plan file, prove selected == planned == manifest
+        export PLAN_OUT_DIR="${CODEBUILD_SRC_DIR}/tg-plans" DESTROY_OUT_DIR="${CODEBUILD_SRC_DIR}/tg-destroy-plans"
+        mkdir -p "$PLAN_OUT_DIR" "$DESTROY_OUT_DIR"
+        tar -xzf "${SAVED}/tg-plans.tar.gz" -C "$PLAN_OUT_DIR"
+        tar -xzf "${SAVED}/tg-destroy-plans.tar.gz" -C "$DESTROY_OUT_DIR"
+        python3 - <<'PY'
+        import json, os, sys, hashlib
+        E = os.environ['ENV_PATH'].strip('/')
+        saved = os.environ['SAVED']
+        man = json.load(open(os.path.join(saved, 'manifest.json')))
+        res = json.load(open(os.path.join(saved, 'plan-result.json')))
+        def die(m):
+            sys.stderr.write('ERROR: %s\n' % m); sys.exit(1)
+        def sha(p):
+            h = hashlib.sha256()
+            with open(p, 'rb') as fh:
+                for b in iter(lambda: fh.read(1 << 20), b''):
+                    h.update(b)
+            return h.hexdigest()
+        def check(entries, root, expect_paths, label):
+            if sorted(e['path'] for e in entries) != sorted(expect_paths):
+                die('%s units in plan-result differ from the manifest' % label)
+            found = set()
+            for r, _, f in os.walk(root):
+                if 'tfplan.tfplan' in f:
+                    found.add(os.path.relpath(r, root).replace('\\', '/'))
+            want = {e['path'][len(E) + 1:] for e in entries}
+            if found != want:
+                die('%s plan files differ from the manifest. missing: %s, unexpected: %s' % (label, sorted(want - found), sorted(found - want)))
+            for e in entries:
+                if sha(os.path.join(root, e['path'][len(E) + 1:], 'tfplan.tfplan')) != e['plan_sha256']:
+                    die('plan file checksum mismatch for %s' % e['path'])
+        check(res['units'], os.environ['PLAN_OUT_DIR'], [u['path'] for u in man['units']], 'normal')
+        check(res['destroy_units'], os.environ['DESTROY_OUT_DIR'],
+              [d['path'] for d in man['destroy_units'] if d['disposition'] == 'destroy-candidate'], 'destroy')
+        print('plan files verified against the manifest')
+        PY
+
+        # ---- 6. credentials of the target account ---------------------------------------------
+        read -r AK SK ST <<< "$(aws sts assume-role --role-arn "$TARGET_ROLE_ARN" --role-session-name tg-apply --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)"
+        export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" AWS_SESSION_TOKEN="$ST"
+        test "$(aws sts get-caller-identity --query Account --output text)" = "$TARGET_ACCOUNT_ID"
+        echo "Applying (${APPLY_MODE}) for ${ENV_PATH} in account ${TARGET_ACCOUNT_ID}"
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        export TG_NON_INTERACTIVE=true
+        read -ra EXTRA <<< "${TG_RUN_EXTRA_ARGS:-}"
+
+        if [ "$APPLY_MODE" = "changes" ]; then
+          # Only units whose saved plan has changes. Exact paths, no graph expansion.
+          UNITS=$(jq -r '.units[] | select(.plan_result == "changes") | .path' "$SAVED/plan-result.json")
+          if [ -z "$UNITS" ]; then
+            echo "No unit has changes. Nothing to apply."
+          else
+            FILTERS=()
+            while IFS= read -r u; do [ -n "$u" ] && FILTERS+=(--filter "{./${u#${ENV_PATH}/}}"); done <<< "$UNITS"
+            cd "${SRC_ROOT}/${ENV_PATH}"
+            terragrunt run --all "${FILTERS[@]}" "${EXTRA[@]}" -- init -input=false
+            # With --out-dir, Terragrunt infers each unit's saved plan file.
+            terragrunt run --all "${FILTERS[@]}" "${EXTRA[@]}" --out-dir "$PLAN_OUT_DIR" -- apply -input=false -lock-timeout=5m
+          fi
+          echo "Applied the approved plans for ${ENV_PATH}."
+        else
+          # Destroy: one unit at a time, dependents first (order computed from the BASELINE graph
+          # by Resolve), from the baseline revision's configuration.
+          BASE_COMMIT=$(jq -r '.baseline.commit' "$SAVED/manifest.json")
+          git -C "$SRC_ROOT" worktree add --detach "$BASE_ROOT" "$BASE_COMMIT" >/dev/null
+          ORDER=$(jq -r '.destroy_order[]' "$SAVED/manifest.json")
+          while IFS= read -r u; do
+            [ -n "$u" ] || continue
+            DST=$(jq -r --arg u "$u" '.destroy_units[] | select(.path == $u) | .plan_result' "$SAVED/plan-result.json")
+            if [ "$DST" != "changes" ]; then echo "skip ${u}: ${DST}"; continue; fi
+            rel="${u#${ENV_PATH}/}"
+            echo "Destroying ${u}"
+            ( cd "${BASE_ROOT}/${u}" \
+              && terragrunt run -- init -input=false \
+              && terragrunt run -- apply -input=false -lock-timeout=5m "${DESTROY_OUT_DIR}/${rel}/tfplan.tfplan" )
+          done <<< "$ORDER"
+          echo "Destroyed the approved units for ${ENV_PATH}."
+        fi

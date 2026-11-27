@@ -1,0 +1,137 @@
+---
+# COMMIT-BASELINE action: the SUCCESS of this action IS the new baseline.
+#
+# There is no parameter or table. The baseline of an environment is, by definition,
+# the source commit of the most recent pipeline execution whose COMMIT-BASELINE action
+# for that stage succeeded (Resolve reads it from CodePipeline's execution history).
+# So this action writes nothing to advance the baseline. It makes sure it can only
+# succeed when everything before it really succeeded, and it stores an audit copy.
+#
+# It must be the LAST action of the environment stage, after Apply (and after the
+# destroy Apply, when there is one). Do not add retries or side effects after it.
+#
+# Input artifacts : SourceOutput (primary, full clone), PlanOutput (secondary)
+# No Terraform, no Terragrunt, no target-account credentials.
+#
+# Required action environment variables
+#   ENV_PATH, PIPELINE_NAME, PIPELINE_STAGE_NAME
+#   PIPELINE_EXECUTION_ID        #{codepipeline.PipelineExecutionId}
+#   EXPECTED_MANIFEST_SHA256     #{PlanDev.MANIFEST_SHA256}
+#   EXPECTED_PLAN_RESULT_SHA256  #{PlanDev.PLAN_RESULT_SHA256}
+# Optional
+#   PLAN_ACTION_NAME (Plan), APPLY_ACTION_NAME (Apply), DESTROY_ACTION_NAME (ApplyDestroy),
+#   COMMIT_ACTION_NAME (CommitBaseline; must equal the name Resolve looks for),
+#   SOURCE_ARTIFACT_NAME (SourceOutput),
+#   RECORDS_BUCKET, RECORDS_KMS_KEY   audit copy of the manifest and plan result (S3, SSE-KMS)
+#
+# IAM: codepipeline:ListActionExecutions and GetPipelineExecution on this pipeline;
+#      s3:PutObject on deployments/<env>/* of RECORDS_BUCKET when used.
+
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - command -v jq >/dev/null 2>&1 || yum install -y jq
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        : "${ENV_PATH:?}" "${PIPELINE_NAME:?}" "${PIPELINE_STAGE_NAME:?}" "${PIPELINE_EXECUTION_ID:?}"
+        : "${EXPECTED_MANIFEST_SHA256:?pass #{PlanNs.MANIFEST_SHA256}}" "${EXPECTED_PLAN_RESULT_SHA256:?pass #{PlanNs.PLAN_RESULT_SHA256}}"
+        export ENV_PATH="${ENV_PATH%/}"
+        ENV_NAME="${ENV_NAME:-$(basename "$ENV_PATH")}"
+        export PLAN_ACTION_NAME="${PLAN_ACTION_NAME:-Plan}" APPLY_ACTION_NAME="${APPLY_ACTION_NAME:-Apply}"
+        export DESTROY_ACTION_NAME="${DESTROY_ACTION_NAME:-ApplyDestroy}" COMMIT_ACTION_NAME="${COMMIT_ACTION_NAME:-CommitBaseline}"
+        SOURCE_ARTIFACT_NAME="${SOURCE_ARTIFACT_NAME:-SourceOutput}"
+        PV="CODEBUILD_SRC_DIR_${PLAN_ARTIFACT_NAME:-PlanOutput}"
+        test -n "${!PV:-}" || { echo "ERROR: input artifact ${PLAN_ARTIFACT_NAME:-PlanOutput} is not attached to this action"; exit 1; }
+        SAVED="${!PV}"
+        export WORK=/tmp/commit-work; rm -rf "$WORK"; mkdir -p "$WORK"
+
+        # ---- artifacts are the ones that were approved ------------------------------------------
+        test "$(cat "$SAVED/env.txt")" = "$ENV_PATH"
+        ( cd "$SAVED" && sha256sum -c manifest.sha256 && sha256sum -c plan-result.sha256 )
+        MANIFEST_SHA256=$(cut -d' ' -f1 "$SAVED/manifest.sha256")
+        PLAN_RESULT_SHA256=$(cut -d' ' -f1 "$SAVED/plan-result.sha256")
+        [ "$MANIFEST_SHA256" = "$EXPECTED_MANIFEST_SHA256" ] || { echo "ERROR: manifest hash differs from the one Plan reported"; exit 1; }
+        [ "$PLAN_RESULT_SHA256" = "$EXPECTED_PLAN_RESULT_SHA256" ] || { echo "ERROR: plan-result hash differs from the one Plan reported"; exit 1; }
+        jq -e --arg e "$ENV_PATH" --arg x "$PIPELINE_EXECUTION_ID" '.env_path == $e and .pipeline.execution_id == $x' "$SAVED/manifest.json" >/dev/null \
+          || { echo "ERROR: manifest is not for this environment/execution"; exit 1; }
+        SOURCE_COMMIT=$(jq -r '.source.commit' "$SAVED/manifest.json")
+        MANIFEST_BASE=$(jq -r '.baseline.commit // ""' "$SAVED/manifest.json")
+        MANIFEST_BASE_SOURCE=$(jq -r '.baseline.source // ""' "$SAVED/manifest.json")
+        test "$(git -C "$CODEBUILD_SRC_DIR" rev-parse HEAD)" = "$SOURCE_COMMIT" \
+          || { echo "ERROR: checked-out commit differs from the manifest source commit"; exit 1; }
+        NEED_DESTROY=$(jq -r '.destroy_required' "$SAVED/plan-result.json")
+
+        # ---- everything before this action really succeeded, for THIS plan -------------------------
+        aws codepipeline list-action-executions --pipeline-name "$PIPELINE_NAME" --output json > "$WORK/actions.json"
+        python3 - <<'PY' > "$WORK/checks.env"
+        import json, os, datetime
+
+        def ts(v):
+            if isinstance(v, (int, float)):
+                return float(v)
+            return datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+
+        d = json.load(open(os.path.join(os.environ['WORK'], 'actions.json'))).get('actionExecutionDetails') or []
+        stage = os.environ['PIPELINE_STAGE_NAME']
+        me = os.environ['PIPELINE_EXECUTION_ID']
+        rows = [x for x in d if x.get('stageName') == stage]
+        mine = [x for x in rows if x.get('pipelineExecutionId') == me]
+        plans = [ts(x['startTime']) for x in mine if x['actionName'] == os.environ['PLAN_ACTION_NAME'] and x['status'] == 'Succeeded']
+        t = max(plans) if plans else None
+
+        def ok_after(name):
+            return t is not None and any(x['actionName'] == name and x['status'] == 'Succeeded' and ts(x['startTime']) > t for x in mine)
+
+        print('PLAN_OK=%s' % ('1' if t is not None else '0'))
+        print('APPLY_OK=%s' % ('1' if ok_after(os.environ['APPLY_ACTION_NAME']) else '0'))
+        print('DESTROY_OK=%s' % ('1' if ok_after(os.environ['DESTROY_ACTION_NAME']) else '0'))
+
+        # Current baseline: newest OTHER execution whose commit action succeeded.
+        ok = [x for x in rows if x['actionName'] == os.environ['COMMIT_ACTION_NAME'] and x['status'] == 'Succeeded' and x.get('pipelineExecutionId') != me]
+        last = max(ok, key=lambda x: ts(x['startTime'])) if ok else None
+        print('CUR_BASE_EXECUTION=%s' % (last['pipelineExecutionId'] if last else ''))
+        PY
+        . "$WORK/checks.env"
+        [ "$PLAN_OK" = "1" ]  || { echo "ERROR: no successful ${PLAN_ACTION_NAME} action in this execution"; exit 1; }
+        [ "$APPLY_OK" = "1" ] || { echo "ERROR: ${APPLY_ACTION_NAME} has not succeeded after the latest ${PLAN_ACTION_NAME}. Baseline NOT advanced."; exit 1; }
+        if [ "$NEED_DESTROY" = "true" ] && [ "$DESTROY_OK" != "1" ]; then
+          echo "ERROR: destroys were required but ${DESTROY_ACTION_NAME} has not succeeded. Baseline NOT advanced."; exit 1
+        fi
+
+        # ---- the baseline did not move since Resolve, and this never moves it backwards ---------
+        CUR_BASE=""
+        if [ -n "$CUR_BASE_EXECUTION" ]; then
+          CUR_BASE=$(aws codepipeline get-pipeline-execution --pipeline-name "$PIPELINE_NAME" --pipeline-execution-id "$CUR_BASE_EXECUTION" \
+                      --query 'pipelineExecution.artifactRevisions' --output json \
+                     | jq -r --arg n "$SOURCE_ARTIFACT_NAME" '(map(select(.name == $n)) | first // .[0]).revisionId // empty')
+        fi
+        if [ "$MANIFEST_BASE_SOURCE" = "override" ]; then
+          echo "NOTE: Resolve used BASELINE_OVERRIDE (${MANIFEST_BASE}); skipping the 'baseline unchanged' check."
+        else
+          [ "$CUR_BASE" = "$MANIFEST_BASE" ] \
+            || { echo "ERROR: the baseline moved while this execution ran (Resolve saw '${MANIFEST_BASE}', history now says '${CUR_BASE}'). Retry the stage."; exit 1; }
+        fi
+        if [ -n "$CUR_BASE" ]; then
+          git -C "$CODEBUILD_SRC_DIR" merge-base --is-ancestor "$CUR_BASE" "$SOURCE_COMMIT" \
+            || { echo "ERROR: ${SOURCE_COMMIT} is not a descendant of the current baseline ${CUR_BASE}. Refusing to move the baseline backwards."; exit 1; }
+        fi
+
+        # ---- audit copy (kept outside the artifact bucket) ---------------------------------------
+        if [ -n "${RECORDS_BUCKET:-}" ]; then
+          URI="s3://${RECORDS_BUCKET}/deployments/${ENV_NAME}/${PIPELINE_EXECUTION_ID}/"
+          KMS_ARGS=(--sse aws:kms); [ -n "${RECORDS_KMS_KEY:-}" ] && KMS_ARGS+=(--sse-kms-key-id "$RECORDS_KMS_KEY")
+          for f in manifest.json manifest.sha256 plan-result.json plan-result.sha256 plan.txt destroy-plan.txt; do
+            aws s3 cp "$SAVED/$f" "${URI}${f}" "${KMS_ARGS[@]}" --only-show-errors
+          done
+          echo "Audit copy: ${URI}"
+        fi
+
+        echo "Baseline for ${ENV_NAME} becomes ${SOURCE_COMMIT} (was ${CUR_BASE:-none}) when this action succeeds."
