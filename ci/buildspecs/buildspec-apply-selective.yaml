@@ -149,8 +149,13 @@ phases:
         DESTROY_REQUIRED=$(jq -r '.destroy_required' "$SAVED/plan-result.json")
 
         # ---- 3. destroy mode: the normal apply of THIS plan must already have succeeded ----
-        if [ "$APPLY_MODE" = "destroy" ]; then
-          [ "$DESTROY_REQUIRED" = "true" ] || { echo "ERROR: no destroy plan has changes; nothing to destroy"; exit 1; }
+        # The destroy action is always present in the stage. With nothing to destroy it succeeds without doing anything.
+        export NOOP=0
+        if [ "$APPLY_MODE" = "destroy" ] && [ "$DESTROY_REQUIRED" != "true" ]; then
+          echo "No destroy plan has changes: nothing to destroy."
+          export NOOP=1
+        fi
+        if [ "$APPLY_MODE" = "destroy" ] && [ "$NOOP" = "0" ]; then
           if [ "$APPLY_REQUIRED" = "true" ]; then
             : "${PIPELINE_NAME:?}" "${PIPELINE_STAGE_NAME:?}"
             export PLAN_ACTION_NAME="${PLAN_ACTION_NAME:-Plan}" APPLY_ACTION_NAME="${APPLY_ACTION_NAME:-Apply}"
@@ -237,6 +242,11 @@ phases:
         set -euo pipefail
         export TG_NON_INTERACTIVE=true
         read -ra EXTRA <<< "${TG_RUN_EXTRA_ARGS:-}"
+
+        if [ "${NOOP:-0}" = "1" ]; then
+          echo "Nothing to do in destroy mode."
+          exit 0
+        fi
 
         if [ "$APPLY_MODE" = "changes" ]; then
           # Only units whose saved plan has changes. Exact paths, no graph expansion.
