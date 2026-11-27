@@ -2,14 +2,15 @@
 # Run it with AWS credentials for the POC account (ap-south-1) after the GitHub connection is AVAILABLE.
 #
 #   .\ci\poc\create-pipeline.ps1 -ConnectionArn arn:aws:codeconnections:ap-south-1:730335384723:connection/xxxx -Repository <github-user>/pipeline-poc
-#   .\ci\poc\create-pipeline.ps1 -ConnectionArn <arn> -Repository <github-user>/pipeline-poc -Bootstrap:$false   # after the first successful run
+#   .\ci\poc\create-pipeline.ps1 -ConnectionArn <arn> -Repository <github-user>/pipeline-poc -BootstrapDev $false   # after PocDev's first success
 #
-# -Bootstrap $true sets BOOTSTRAP=true on both Resolve actions: the very first run of each
-# environment plans ALL units. Switch it off once each environment has one successful CommitBaseline.
+# -BootstrapDev / -BootstrapStage set BOOTSTRAP=true on that stage's Resolve action: the very first
+# run of an environment plans ALL units. Switch each one off once its stage has one successful CommitBaseline.
 param(
   [Parameter(Mandatory = $true)][string]$ConnectionArn,
   [Parameter(Mandatory = $true)][string]$Repository,   # <github-user>/<repo>, exact case
-  [bool]$Bootstrap = $true,
+  [bool]$BootstrapDev = $true,     # set to $false after PocDev has one successful CommitBaseline
+  [bool]$BootstrapStage = $true,   # set to $false after PocStage has one successful CommitBaseline
   [string]$Account = '730335384723',
   [string]$Region = 'ap-south-1',
   [string]$TerraformVersion = '1.17.2',
@@ -35,7 +36,7 @@ function Build($name, $project, $inputs, $outputs, $ns, $order, $vars) {
   if ($ns) { $a.namespace = $ns }
   return $a
 }
-function EnvStage($stage, $suffix, $envName, $roleName) {
+function EnvStage($stage, $suffix, $envName, $roleName, $bootstrap) {
   $envPath = "environments/$envName"
   $common = @{ ENV_PATH = $envPath; PIPELINE_NAME = $pipeline; PIPELINE_STAGE_NAME = $stage; PIPELINE_EXECUTION_ID = '#{codepipeline.PipelineExecutionId}' }
   $tools = @{ TERRAFORM_VERSION = $TerraformVersion; TERRAGRUNT_VERSION = $TerragruntVersion }
@@ -43,7 +44,7 @@ function EnvStage($stage, $suffix, $envName, $roleName) {
   $expected = @{ EXPECTED_MANIFEST_SHA256 = "#{Plan$suffix.MANIFEST_SHA256}"; EXPECTED_PLAN_RESULT_SHA256 = "#{Plan$suffix.PLAN_RESULT_SHA256}"; PLAN_ARTIFACT_NAME = "PlanOutput$suffix" }
 
   $resolveVars = $common + $tools + @{ SOURCE_COMMIT = '#{SourceVariables.CommitId}' }
-  if ($Bootstrap) { $resolveVars.BOOTSTRAP = 'true' }
+  if ($bootstrap) { $resolveVars.BOOTSTRAP = 'true' }
   $planVars = $common + $tools + $target + @{ MANIFEST_ARTIFACT_NAME = "ManifestOutput$suffix" }
   $applyVars = $common + $tools + $target + $expected + @{ APPLY_MODE = 'changes' }
   $commitVars = $common + $expected
@@ -82,7 +83,7 @@ $definition = @{
     artifactStore = @{ type = 'S3'; location = "$p-artifacts-$Account" }
     pipelineType = 'V2'
     executionMode = 'QUEUED'
-    stages = @($source, (EnvStage 'PocDev' 'Dev' 'poc-dev' "$p-tf-admin-dev"), (EnvStage 'PocStage' 'Stage' 'poc-stage' "$p-tf-admin-stage"))
+    stages = @($source, (EnvStage 'PocDev' 'Dev' 'poc-dev' "$p-tf-admin-dev" $BootstrapDev), (EnvStage 'PocStage' 'Stage' 'poc-stage' "$p-tf-admin-stage" $BootstrapStage))
   }
 }
 $file = Join-Path $env:TEMP 'pipeline-poc-iac.json'
