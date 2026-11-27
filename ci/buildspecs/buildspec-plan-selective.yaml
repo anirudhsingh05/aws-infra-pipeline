@@ -123,13 +123,8 @@ phases:
         export ENV_NAME="${ENV_NAME:-$(basename "$ENV_PATH")}"
         test -d "${CODEBUILD_SRC_DIR}/${ENV_PATH}"
 
-        redact() {
-          sed -E -i \
-            -e 's/\b(AKIA|ASIA)[0-9A-Z]{16}\b/[REDACTED-AWS-KEY-ID]/g' \
-            -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[REDACTED-JWT]/g' \
-            -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]{16,}/\1[REDACTED]/g' \
-            -e 's/((password|secret|token|api_key|secret_key|private_key)[A-Za-z_]*[[:space:]]*[=:][[:space:]]*)"[^"]+"/\1"[REDACTED]"/gI' "$1"
-        }
+        # NOTE: CodeBuild keeps exported variables between phases but NOT shell functions, so
+        # helper functions must be defined in the same phase (command block) that uses them.
 
         # ---- verify the manifest from Resolve ------------------------------------------------
         # Output artifact names must be unique in a pipeline, so each environment stage uses its
@@ -180,6 +175,15 @@ phases:
         set -euo pipefail
         export TG_NON_INTERACTIVE=true
         read -ra EXTRA <<< "${TG_RUN_EXTRA_ARGS:-}"
+
+        # Best-effort redaction of secrets in the human-readable summaries.
+        redact() {
+          sed -E -i \
+            -e 's/\b(AKIA|ASIA)[0-9A-Z]{16}\b/[REDACTED-AWS-KEY-ID]/g' \
+            -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[REDACTED-JWT]/g' \
+            -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]{16,}/\1[REDACTED]/g' \
+            -e 's/((password|secret|token|api_key|secret_key|private_key)[A-Za-z_]*[[:space:]]*[=:][[:space:]]*)"[^"]+"/\1"[REDACTED]"/gI' "$1"
+        }
 
         # One exact-path filter per unit. No graph operators: nothing is added or expanded here.
         filters_for() {   # $1 = newline separated repo-relative unit paths
