@@ -15,3 +15,6 @@ Only the units that changed since the last successful deployment of an environme
 | `ci/buildspecs/` | Resolve, Plan, Apply and CommitBaseline buildspecs |
 | `ci/poc/` | Scripts to create the GitHub connection, set repository access and create the pipeline |
 | `docs/change-aware-deployment/POC.md` | POC runbook: resources created and cleanup |
+
+
+(test3b: unrelated docs commit after a rejected change)
